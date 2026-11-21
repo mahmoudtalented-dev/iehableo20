@@ -1,0 +1,175 @@
+name: RDP-Windows2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP (NLA on, Tailscale-only firewall)
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
+          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP user
+        shell: pwsh
+        env:
+          RDP_USER: ${{ secrets.RDP_USER }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USER) -or [string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              Write-Error "RDP_USER or RDP_PASSWORD secret is missing."
+              exit 1
+          }
+          if (Get-LocalUser -Name $env:RDP_USER -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name $env:RDP_USER
+          }
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $securePass -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction Stop
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER -ErrorAction Stop
+          Write-Host "User created and added to groups."
+
+      - name: Install everything in parallel
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'   # big speedup for Invoke-WebRequest
+
+          $jobs = @()
+
+          # Job 1: Tailscale MSI, then Node.js MSI (MSI installers cannot run at the same time)
+          $jobs += Start-Job -Name "msi" -ScriptBlock {
+              $ProgressPreference = 'SilentlyContinue'
+              $ErrorActionPreference = 'Stop'
+
+              $ts = "$env:TEMP\tailscale.msi"
+              Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $ts
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$ts`"", "/quiet", "/norestart" -Wait
+              Remove-Item $ts -Force
+
+              $idx = Invoke-RestMethod -Uri "https://nodejs.org/dist/index.json"
+              $ver = ($idx | Where-Object { $_.lts -ne $false } | Select-Object -First 1).version
+              if (-not $ver) { throw "Could not determine latest Node.js LTS version." }
+              $node = "$env:TEMP\node.msi"
+              Invoke-WebRequest -Uri "https://nodejs.org/dist/$ver/node-$ver-x64.msi" -OutFile $node
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$node`"", "/quiet", "/norestart" -Wait
+              Remove-Item $node -Force
+              "Tailscale + Node.js $ver installed."
+          }
+
+          # Job 2: Python packages (single pip call is much faster than one call per package)
+          $jobs += Start-Job -Name "pip" -ScriptBlock {
+              $pkgs = @("curl_cffi","phonenumbers","PyExecJS","user-agents","colorama","faker","tlsmask","urllib3","requests")
+              python -m pip install --disable-pip-version-check --no-input @pkgs
+              if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+              "Python packages installed."
+          }
+
+          # Job 3: Brave (official installer)
+          $jobs += Start-Job -Name "brave" -ScriptBlock {
+              $ProgressPreference = 'SilentlyContinue'
+              $ErrorActionPreference = 'Stop'
+              $exe = "$env:TEMP\brave_installer.exe"
+              Invoke-WebRequest -Uri "https://brave-browser-downloads.s3.brave.com/latest/brave_installer-x64.exe" -OutFile $exe
+              Start-Process -FilePath $exe -ArgumentList "--install", "--silent", "--system-level" -Wait
+              Remove-Item $exe -Force
+              "Brave installed."
+          }
+
+          # Job 4: Notepad++ (direct download from GitHub, faster than winget)
+          $jobs += Start-Job -Name "npp" -ScriptBlock {
+              $ProgressPreference = 'SilentlyContinue'
+              $ErrorActionPreference = 'Stop'
+              $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/notepad-plus-plus/notepad-plus-plus/releases/latest" -Headers @{ "User-Agent" = "gh-actions" }
+              $asset = $rel.assets | Where-Object { $_.name -match "Installer\.x64\.exe$" } | Select-Object -First 1
+              if (-not $asset) { throw "Notepad++ installer asset not found." }
+              $exe = "$env:TEMP\npp_installer.exe"
+              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $exe
+              Start-Process -FilePath $exe -ArgumentList "/S" -Wait
+              Remove-Item $exe -Force
+              "Notepad++ installed."
+          }
+
+          # Job 5: Remove Firefox (it is preinstalled on the runner image, not installed by this workflow)
+          $jobs += Start-Job -Name "firefox" -ScriptBlock {
+              Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force
+              foreach ($p in @("$env:ProgramFiles\Mozilla Firefox", "${env:ProgramFiles(x86)}\Mozilla Firefox")) {
+                  if (Test-Path $p) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
+              }
+              "Firefox removed."
+          }
+
+          # Wait for everything and report
+          $failed = $false
+          foreach ($j in $jobs) {
+              Wait-Job $j | Out-Null
+              Write-Host "=== $($j.Name) ==="
+              Receive-Job $j -ErrorAction Continue | Write-Host
+              if ($j.State -ne 'Completed') {
+                  Write-Warning "Job $($j.Name) ended with state $($j.State)"
+                  if ($j.Name -ne "firefox") { $failed = $true }
+              }
+              Remove-Job $j
+          }
+          if ($failed) { exit 1 }
+
+          # Show installed versions (refresh PATH first)
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          node --version
+          npm --version
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-win-$env:GITHUB_RUN_ID" --unattended
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "tailscale up failed (check TAILSCALE_AUTH_KEY)."
+              exit 1
+          }
+          $tsIP = $null
+          for ($i = 0; $i -lt 12 -and -not $tsIP; $i++) {
+              $tsIP = (& $ts ip -4 2>$null | Select-Object -First 1)
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned."
+              exit 1
+          }
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP port
+        shell: pwsh
+        run: |
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) {
+              Write-Error "RDP port 3389 is not reachable."
+              exit 1
+          }
+          Write-Host "RDP port is reachable."
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          Write-Host "=== RDP READY ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username/Password: from your repo secrets"
+          Write-Host "================="
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP active"
+              Start-Sleep -Seconds 300
+          }
